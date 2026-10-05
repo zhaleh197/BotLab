@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: botsaz
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL        # Neon (free) Postgres connection string
+        sync: false
+      - key: LLM_API_KEY         # Gemini / Groq / OpenRouter key
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: LLM_MODEL
+        value: gemini-3.5-flash
+      - key: JWT_SECRET
+        generateValue: true
