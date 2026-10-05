@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="BotSaz", lifespan=lifespan)
+app = FastAPI(title="BotLab", lifespan=lifespan)
 app.include_router(router)
 
 if FRONTEND_DIST.exists():

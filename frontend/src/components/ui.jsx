@@ -69,7 +69,7 @@ export function Logo({ small }) {
       <span className={`grid place-items-center rounded-xl bg-gradient-to-br from-brand-500 to-violet-500 text-white ${small ? 'size-8' : 'size-10'}`}>
         <Bot className={small ? 'size-5' : 'size-6'} />
       </span>
-      <span className={small ? 'text-lg' : 'text-xl'}>باتساز</span>
+      <span dir="ltr" className={`tracking-tight ${small ? 'text-lg' : 'text-xl'}`}>Bot<span className="text-brand-600">Lab</span></span>
     </Link>
   )
 }

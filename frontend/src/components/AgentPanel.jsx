@@ -117,7 +117,7 @@ export default function AgentPanel({ messages, running, onSend, onAction, hasBot
       <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3">
         <span className="grid size-8 place-items-center rounded-lg bg-gradient-to-br from-brand-500 to-violet-500 text-white"><Sparkles className="size-4" /></span>
         <div>
-          <div className="text-sm font-bold">ایجنت باتساز</div>
+          <div className="text-sm font-bold">ایجنت BotLab</div>
           <div className="text-xs text-slate-500">{running ? 'در حال کار…' : 'آمادهٔ دریافت درخواست'}</div>
         </div>
       </div>

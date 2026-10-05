@@ -16,8 +16,8 @@ export default function App() {
     if (!auth.token) { setUser(null); return }
     api('/api/me').then(setUser).catch(() => setUser(null))
     const onLogout = () => setUser(null)
-    window.addEventListener('botsaz-logout', onLogout)
-    return () => window.removeEventListener('botsaz-logout', onLogout)
+    window.addEventListener('botlab-logout', onLogout)
+    return () => window.removeEventListener('botlab-logout', onLogout)
   }, [])
 
   const login = ({ token, user }) => { auth.set(token); setUser(user) }
