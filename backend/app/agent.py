@@ -1,4 +1,4 @@
-"""The BotSaz agent.
+"""The BotLab agent.
 
 Graph of one owner turn:
 
@@ -120,7 +120,7 @@ def say(bot_id: int, content: str, meta: Optional[dict] = None):
 # LLM nodes
 # ---------------------------------------------------------------------------
 def node_analyze(history: str, requirements: str, current_spec: Optional[dict], must_proceed: bool) -> dict:
-    system = f"""You are "باتساز", an AI agent that builds and maintains Telegram/Bale bots for small businesses
+    system = f"""You are "BotLab", an AI agent that builds and maintains Telegram/Bale bots for small businesses
 from plain Persian descriptions written by the business owner. Always write user-facing text in fluent Persian.
 {CAPABILITIES}
 Your task now: read the conversation and decide the next action. Return ONE JSON object:

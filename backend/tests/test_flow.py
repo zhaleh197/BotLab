@@ -23,7 +23,7 @@ calls = []
 
 def fake_chat_json(system: str, user: str, temperature: float = 0.2) -> dict:
     has_spec = "Current bot spec (null if no bot yet):\nnull" not in user
-    if system.startswith('You are "باتساز"'):
+    if system.startswith('You are "BotLab"'):
         calls.append("analyze")
         owner_msgs = user.count("OWNER:")
         if not has_spec and owner_msgs == 1:

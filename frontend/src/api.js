@@ -1,4 +1,4 @@
-const TOKEN_KEY = 'botsaz_token'
+const TOKEN_KEY = 'botlab_token'
 
 export const auth = {
   get token() {
@@ -17,7 +17,7 @@ export async function api(path, { method = 'GET', body } = {}) {
   try { data = await res.json() } catch { /* empty body */ }
   if (res.status === 401) {
     auth.set(null)
-    window.dispatchEvent(new Event('botsaz-logout'))
+    window.dispatchEvent(new Event('botlab-logout'))
   }
   if (!res.ok) {
     const d = data?.detail
