@@ -2,19 +2,27 @@
 import traceback
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from .engine import FIELD_PROMPTS, Engine, L, normalize
+from .engine import FIELD_PROMPTS, Engine, L, Out, normalize
 from .spec import BotSpec
 
 
 class TestStep(BaseModel):
     user: str = "u1"
-    send: str
+    send: str = Field(default="", description="Text or exact button label the user sends")
+    pay: bool = Field(default=False, description="The user pays the latest invoice they received (sandbox payment)")
+    wait_minutes: int = Field(default=0, ge=0, le=1440, description="Advance the clock before this step")
     expect: list[str] = Field(default_factory=list, description="Substrings that must appear in replies to `user`")
     expect_not: list[str] = Field(default_factory=list)
     notify: dict[str, list[str]] = Field(default_factory=dict,
                                          description="Other users that must receive a message containing these")
+
+    @model_validator(mode="after")
+    def _has_action(self):
+        if not self.send and not self.pay and not self.wait_minutes:
+            raise ValueError("a step needs send, pay or wait_minutes")
+        return self
 
 
 class TestCase(BaseModel):
@@ -26,21 +34,58 @@ class TestCase(BaseModel):
 
 
 def _flatten(outs) -> str:
-    return "\n".join(o.text + "\n" + " | ".join(b for row in o.buttons for b in row) for o in outs)
+    parts = []
+    for o in outs:
+        parts.append(o.text + "\n" + " | ".join(b for row in o.buttons for b in row))
+        if o.invoice:
+            parts.append(f"💳 صورت‌حساب: {o.invoice['title']} — {o.invoice['amount']}")
+    return "\n".join(parts)
+
+
+START_CLOCK = 1_800_000_000.0
+
+
+def _step_label(step: TestStep) -> str:
+    bits = []
+    if step.wait_minutes:
+        bits.append(f"⏱ +{step.wait_minutes} دقیقه")
+    if step.pay:
+        bits.append("💳 پرداخت آزمایشی")
+    if step.send:
+        bits.append(step.send)
+    return " · ".join(bits)
 
 
 def run_test(spec: BotSpec, tc: TestCase) -> dict:
     data: dict = {}
-    eng = Engine(spec, data, now_hour=tc.now_hour if tc.now_hour is not None else 12)
+    eng = Engine(spec, data, now_hour=tc.now_hour if tc.now_hour is not None else 12, now=START_CLOCK)
     transcript = []
+    invoices: dict[str, dict] = {}  # latest invoice each user received
     for i, step in enumerate(tc.steps):
         try:
-            outs = eng.handle(step.user, step.send, name=f"کاربر {step.user}")
+            eng.now += step.wait_minutes * 60
+            outs: list[Out] = []
+            if step.pay:
+                inv = invoices.get(step.user)
+                if not inv:
+                    outs.append(Out(step.user, "❌ صورت‌حسابی برای پرداخت وجود ندارد."))
+                else:
+                    err, pre = eng.pre_checkout(step.user, inv["payload"])
+                    outs += pre
+                    outs += [Out(step.user, "❌ پرداخت رد شد: " + err)] if err else \
+                        eng.payment_success(step.user, inv["payload"], f"TEST-{i}", inv["amount"])
+            if step.send:
+                outs += eng.handle(step.user, step.send, name=f"کاربر {step.user}")
+            elif not step.pay:
+                outs += eng.sweep()
         except Exception as e:  # engine bug: report, never crash the agent
             return {"name": tc.name, "origin": tc.origin, "passed": False, "failed_step": i,
                     "reason": f"خطای اجرای بات: {e}", "trace": traceback.format_exc()[-800:],
                     "transcript": transcript}
-        transcript.append({"user": step.user, "send": step.send, "replies": [o.as_dict() for o in outs]})
+        for o in outs:
+            if o.invoice:
+                invoices[o.to] = o.invoice
+        transcript.append({"user": step.user, "send": _step_label(step), "replies": [o.as_dict() for o in outs]})
         mine = normalize(_flatten([o for o in outs if o.to == step.user]))
         problems = [f"انتظار «{e}» در پاسخ بود" for e in step.expect if normalize(e) not in mine]
         problems += [f"«{e}» نباید در پاسخ باشد" for e in step.expect_not if normalize(e) in mine]
@@ -94,14 +139,35 @@ def _workshop_auto(spec: BotSpec) -> list[TestCase]:
     cfg = spec.workshop
     f = cfg.collect_fields
     tests = []
+
+    def paid(sess) -> bool:
+        return cfg.require_payment and sess.price > 0
     s0 = cfg.sessions[0]
     steps = [TestStep(send="/start"), TestStep(send=L.W_LIST, expect=[s0.title])]
     steps.append(TestStep(send=L.W_SESSION + s0.title, expect=[FIELD_PROMPTS[f[0]][:12]] if f else [L.CONFIRM]))
     steps += _fill("u1", f, 1)
-    steps.append(TestStep(send=L.CONFIRM, expect=["ثبت‌نام شما", "کد پیگیری"]))
-    steps.append(TestStep(send=L.W_MY, expect=[s0.title]))
-    tests.append(TestCase(name="ثبت‌نام موفق", origin="auto",
-                          description=f"یک کاربر در «{s0.title}» ثبت‌نام می‌کند.", steps=steps))
+    if paid(s0):
+        steps.append(TestStep(send=L.CONFIRM, expect=["پرداخت", "💳 صورت‌حساب"],
+                              expect_not=["کد پیگیری"]))
+        steps.append(TestStep(send=L.W_MY, expect=["در انتظار پرداخت"]))
+        steps.append(TestStep(pay=True, expect=["پرداخت انجام شد", "قطعی شد", "کد پیگیری"]))
+    else:
+        steps.append(TestStep(send=L.CONFIRM, expect=["ثبت‌نام شما", "کد پیگیری"]))
+    steps.append(TestStep(send=L.W_MY, expect=[s0.title], expect_not=["در انتظار پرداخت"]))
+    tests.append(TestCase(name="ثبت‌نام موفق" + (" با پرداخت" if paid(s0) else ""), origin="auto",
+                          description=f"یک کاربر در «{s0.title}» ثبت‌نام می‌کند"
+                                      + (" و فقط پس از پرداخت ثبت‌نامش قطعی می‌شود." if paid(s0) else "."),
+                          steps=steps))
+
+    if paid(s0):
+        steps = [TestStep(send=L.W_SESSION + s0.title)] + _fill("u1", f, 1)
+        steps.append(TestStep(send=L.CONFIRM, expect=["پرداخت"]))
+        steps.append(TestStep(wait_minutes=cfg.payment_hold_minutes + 1, send=L.W_MY,
+                              expect=["مهلت پرداخت", "هنوز در هیچ کارگاهی"]))
+        steps.append(TestStep(pay=True, expect=["پرداخت رد شد"]))
+        tests.append(TestCase(name="بدون پرداخت، جا آزاد می‌شود", origin="auto",
+                              description=f"اگر ظرف {cfg.payment_hold_minutes} دقیقه پرداخت نشود، جای رزروشده آزاد "
+                                          f"می‌شود و پرداخت دیرهنگام پذیرفته نمی‌شود.", steps=steps))
 
     s = min(cfg.sessions, key=lambda x: x.capacity)
     if s.capacity <= 40:
@@ -110,7 +176,11 @@ def _workshop_auto(spec: BotSpec) -> list[TestCase]:
             uid = f"u{i}"
             steps.append(TestStep(user=uid, send=L.W_SESSION + s.title))
             steps += _fill(uid, f, i)
-            steps.append(TestStep(user=uid, send=L.CONFIRM, expect=["ثبت‌نام شما"]))
+            if paid(s):
+                steps.append(TestStep(user=uid, send=L.CONFIRM, expect=["پرداخت"]))
+                steps.append(TestStep(user=uid, pay=True, expect=["قطعی شد"]))
+            else:
+                steps.append(TestStep(user=uid, send=L.CONFIRM, expect=["ثبت‌نام شما"]))
         extra = f"u{s.capacity + 1}"
         if cfg.waitlist.enabled:
             steps.append(TestStep(user=extra, send=L.W_SESSION + s.title, expect=["تکمیل", L.W_JOIN_WAIT]))
@@ -120,7 +190,9 @@ def _workshop_auto(spec: BotSpec) -> list[TestCase]:
             if cfg.allow_cancel:
                 steps.append(TestStep(user="u1", send=L.W_CANCEL, expect=[L.W_CANCEL_ITEM + s.title]))
                 steps.append(TestStep(user="u1", send=L.W_CANCEL_ITEM + s.title, expect=["لغو شد"],
-                                      notify={extra: ["ثبت‌نام شما قطعی شد"]}))
+                                      notify={extra: ["جا باز شد"]}))
+                if paid(s):
+                    steps.append(TestStep(user=extra, pay=True, expect=["قطعی شد"]))
             name, desc = "ظرفیت و فهرست انتظار", "پس از تکمیل ظرفیت، نفر بعدی به فهرست انتظار می‌رود."
         else:
             steps.append(TestStep(user=extra, send=L.W_SESSION + s.title, expect=["تکمیل"],
@@ -163,7 +235,11 @@ def _order_auto(spec: BotSpec) -> list[TestCase]:
                 steps += add(it)
             steps.append(TestStep(send=L.O_CHECKOUT, expect=[FIELD_PROMPTS[fields[0]][:12]] if fields else [L.CONFIRM]))
             steps += _fill("u1", fields, 1)
-            steps.append(TestStep(send=L.CONFIRM, expect=["سفارش شما ثبت شد"]))
+            if cfg.require_payment:
+                steps.append(TestStep(send=L.CONFIRM, expect=["منتظر پرداخت", "💳 صورت‌حساب"]))
+                steps.append(TestStep(pay=True, expect=["پرداخت انجام شد", "قطعی شد"]))
+            else:
+                steps.append(TestStep(send=L.CONFIRM, expect=["سفارش شما ثبت شد"]))
             tests.append(TestCase(name="سفارش کامل", origin="auto", now_hour=open_h,
                                   description="افزودن آیتم‌ها، ثبت اطلاعات و نهایی کردن سفارش.", steps=steps))
 

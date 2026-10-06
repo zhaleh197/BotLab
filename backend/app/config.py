@@ -47,3 +47,7 @@ PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "")
 
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", BASE_DIR.parent / "frontend" / "dist"))
 TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Tehran")
+
+# Telegram payment providers have no rial: toman prices are converted for Telegram invoices (demo/testing).
+TELEGRAM_PAYMENT_CURRENCY = os.getenv("TELEGRAM_PAYMENT_CURRENCY", "USD")
+TOMAN_PER_USD = float(os.getenv("TOMAN_PER_USD", "100000"))

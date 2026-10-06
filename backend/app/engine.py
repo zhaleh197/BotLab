@@ -5,6 +5,7 @@ messages (possibly addressed to other users, e.g. waitlist promotions). All stat
 in the plain-JSON `data` dict so it can be persisted anywhere and reset for tests.
 """
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -19,9 +20,14 @@ class Out:
     to: str
     text: str
     buttons: list[list[str]] = field(default_factory=list)
+    # A payment request: {"payload", "title", "description", "amount"} (amount in the spec currency).
+    invoice: Optional[dict] = None
 
     def as_dict(self):
-        return {"to": self.to, "text": self.text, "buttons": self.buttons}
+        d = {"to": self.to, "text": self.text, "buttons": self.buttons}
+        if self.invoice:
+            d["invoice"] = self.invoice
+        return d
 
 
 class L:
@@ -36,6 +42,7 @@ class L:
     W_JOIN_WAIT = "⏳ عضویت در فهرست انتظار"
     W_SESSION = "📝 "        # + session title
     W_CANCEL_ITEM = "🚫 "    # + session title
+    W_PAY = "💳 پرداخت "     # + session title (re-send the invoice of a held seat)
     # order
     O_MENU = "🍽 منو"
     O_CART = "🛒 سبد خرید"
@@ -97,10 +104,11 @@ def valid_field(name: str, value: str) -> Optional[str]:
 
 
 class Engine:
-    def __init__(self, spec: BotSpec, data: dict, now_hour: Optional[int] = None):
+    def __init__(self, spec: BotSpec, data: dict, now_hour: Optional[int] = None, now: Optional[float] = None):
         self.spec = spec
         self.data = data
         self.now_hour = now_hour
+        self.now = now if now is not None else time.time()
         data.setdefault("users", {})
         data.setdefault("seq", 0)
         if spec.template == "workshop":
@@ -142,7 +150,10 @@ class Engine:
 
     # ---------- entry point ----------
     def handle(self, uid: str, text: str, name: str = "") -> list[Out]:
-        uid = str(uid)
+        expired = self.sweep()
+        return expired + self._handle(str(uid), text, name)
+
+    def _handle(self, uid: str, text: str, name: str = "") -> list[Out]:
         u = self._user(uid, name)
         text = (text or "").strip()
 
@@ -162,6 +173,80 @@ class Engine:
         if self.spec.template == "workshop":
             return self._workshop(uid, u, text)
         return self._order(uid, u, text)
+
+    # ---------- payments ----------
+    def _hold_seconds(self) -> int:
+        cfg = self.spec.workshop or self.spec.order
+        return cfg.payment_hold_minutes * 60
+
+    def _left_minutes(self, entry) -> int:
+        return max(1, int((entry["expires"] - self.now + 59) // 60))
+
+    def sweep(self) -> list[Out]:
+        """Release seats/orders whose payment window has passed (and promote the waitlist)."""
+        outs: list[Out] = []
+        if self.spec.template == "workshop":
+            for s in self.spec.workshop.sessions:
+                regs = self._regs(s.id)
+                gone = [r for r in regs if r.get("status") == "pending" and r["expires"] <= self.now]
+                if not gone:
+                    continue
+                regs[:] = [r for r in regs if r not in gone]
+                for r in gone:
+                    outs.append(Out(r["uid"], f"⌛ مهلت پرداخت کارگاه «{s.title}» تمام شد و جای رزروشده آزاد شد.",
+                                    self.main_buttons()))
+                outs += self._promote(s)
+        else:
+            for o in self.data["orders"]:
+                if o.get("status") == "pending_payment" and o["expires"] <= self.now:
+                    o["status"] = "expired"
+                    outs.append(Out(o["uid"], f"⌛ مهلت پرداخت سفارش {o['code']} تمام شد و سفارش لغو شد.",
+                                    self.main_buttons()))
+        return outs
+
+    def _find_payable(self, payload: str):
+        kind, _, code = (payload or "").partition(":")
+        if kind == "W" and self.spec.template == "workshop":
+            for s in self.spec.workshop.sessions:
+                for r in self._regs(s.id):
+                    if r.get("code") == code:
+                        return s, r
+        if kind == "O" and self.spec.template == "order":
+            for o in self.data["orders"]:
+                if o.get("code") == code:
+                    return None, o
+        return None, None
+
+    def pre_checkout(self, uid: str, payload: str) -> tuple[Optional[str], list[Out]]:
+        """Called by the platform right before charging. Returns (error or None, outgoing messages)."""
+        outs = self.sweep()
+        _, entry = self._find_payable(payload)
+        if not entry or entry.get("uid") != str(uid):
+            return "این صورت‌حساب معتبر نیست.", outs
+        if entry.get("status") not in ("pending", "pending_payment"):
+            return "مهلت پرداخت این صورت‌حساب تمام شده یا قبلاً پرداخت شده است.", outs
+        return None, outs
+
+    def payment_success(self, uid: str, payload: str, charge_id: str = "", amount: int = 0) -> list[Out]:
+        """Called when the platform confirms the money was received. Only this confirms a paid booking."""
+        uid = str(uid)
+        s, entry = self._find_payable(payload)
+        support = f"\n☎️ {self.spec.support_contact}" if self.spec.support_contact else ""
+        if not entry or entry.get("status") not in ("pending", "pending_payment"):
+            self.data.setdefault("unmatched_payments", []).append(
+                {"uid": uid, "payload": payload, "charge_id": charge_id, "amount": amount, "at": self.now})
+            return [self._menu(uid, "پرداخت شما دریافت شد اما مهلت رزرو تمام شده بود. "
+                                    "برای پیگیری و بازگشت وجه با پشتیبانی تماس بگیرید." + support)]
+        entry.pop("expires", None)
+        entry["charge_id"] = charge_id
+        receipt = f"\n🧾 شمارهٔ تراکنش: {charge_id}" if charge_id else ""
+        if s:  # workshop seat
+            entry["status"] = "paid"
+            return [self._menu(uid, f"✅ پرداخت انجام شد و ثبت‌نام شما در کارگاه «{s.title}» قطعی شد.\n"
+                                    f"🗓 {s.when}\n🔖 کد پیگیری: {entry['code']}" + receipt)]
+        entry["status"], entry["paid"] = "new", True
+        return [self._menu(uid, f"✅ پرداخت انجام شد و سفارش {entry['code']} قطعی شد.\n"
+                                f"💳 مبلغ: {self.money(entry['total'])}\nاز خرید شما متشکریم 🙏" + receipt)]
 
     # ---------- shared: field collection ----------
     def _start_fields(self, uid, u, fields: list[str], ctx: dict) -> list[Out]:
@@ -219,6 +304,40 @@ class Engine:
     def _user_waits(self, uid) -> list:
         return [s for s in self.spec.workshop.sessions if any(r["uid"] == uid for r in self._wait(s.id))]
 
+    def _needs_payment(self, s) -> bool:
+        return self.spec.workshop.require_payment and s.price > 0
+
+    def _invoice(self, s, entry) -> dict:
+        return {"payload": f"W:{entry['code']}", "title": s.title[:32],
+                "description": f"ثبت‌نام در کارگاه {s.title} — {s.when}"[:255], "amount": s.price}
+
+    def _hold_out(self, uid, s, entry, head: str) -> Out:
+        return Out(uid, f"{head}\n⏳ این جا تا {self._left_minutes(entry)} دقیقه برای شما نگه داشته می‌شود.\n"
+                        f"💳 برای قطعی شدن ثبت‌نام، مبلغ {self.money(s.price)} را با صورت‌حساب زیر پرداخت کنید. "
+                        f"بدون پرداخت، ثبت‌نام قطعی نمی‌شود.", self.main_buttons(), invoice=self._invoice(s, entry))
+
+    def _w_resend_invoice(self, uid, s) -> Out:
+        entry = next((r for r in self._regs(s.id) if r["uid"] == uid and r.get("status") == "pending"), None)
+        if not entry:
+            return self._menu(uid, f"پرداخت معوقی برای کارگاه «{s.title}» ندارید.")
+        return self._hold_out(uid, s, entry, f"🧾 صورت‌حساب کارگاه «{s.title}»")
+
+    def _promote(self, s) -> list[Out]:
+        """Fill free seats from the waitlist; paid sessions get a payment hold instead of a confirmed seat."""
+        outs, wait, regs = [], self._wait(s.id), self._regs(s.id)
+        while self.spec.workshop.waitlist.enabled and wait and self._remaining(s) > 0:
+            nxt = wait.pop(0)
+            nxt["code"] = self._code("W")
+            if self._needs_payment(s):
+                nxt["status"], nxt["expires"] = "pending", self.now + self._hold_seconds()
+                regs.append(nxt)
+                outs.append(self._hold_out(nxt["uid"], s, nxt, f"🎉 خبر خوب! در کارگاه «{s.title}» جا باز شد."))
+            else:
+                regs.append(nxt)
+                outs.append(Out(nxt["uid"], f"🎉 خبر خوب! در کارگاه «{s.title}» جا باز شد و ثبت‌نام شما قطعی شد.\n"
+                                            f"🗓 {s.when}\n🔖 کد پیگیری: {nxt['code']}", self.main_buttons()))
+        return outs
+
     def _waitlist_has_room(self, s) -> bool:
         w = self.spec.workshop.waitlist
         return w.enabled and (w.max_size == 0 or len(self._wait(s.id)) < w.max_size)
@@ -246,6 +365,9 @@ class Engine:
             return [self._menu(uid, "ابتدا از «کارگاه‌ها»، کارگاه تکمیل‌شدهٔ موردنظر را انتخاب کنید.")]
         if matches(text, L.W_LIST):
             return [self._w_list(uid)]
+        for s in cfg.sessions:
+            if matches(text, L.W_PAY + s.title):
+                return [self._w_resend_invoice(uid, s)]
         if matches(text, L.W_MY):
             return [self._w_my(uid)]
         if cfg.allow_cancel and matches(text, L.W_CANCEL):
@@ -277,7 +399,10 @@ class Engine:
 
     def _w_select(self, uid, u, s) -> list[Out]:
         cfg = self.spec.workshop
-        if any(r["uid"] == uid for r in self._regs(s.id)):
+        mine = next((r for r in self._regs(s.id) if r["uid"] == uid), None)
+        if mine and mine.get("status") == "pending":
+            return [self._hold_out(uid, s, mine, f"رزرو شما در کارگاه «{s.title}» در انتظار پرداخت است.")]
+        if mine:
             return [self._menu(uid, f"شما قبلاً در کارگاه «{s.title}» ثبت‌نام کرده‌اید ✅")]
         pos = next((i + 1 for i, r in enumerate(self._wait(s.id)) if r["uid"] == uid), None)
         if pos:
@@ -311,8 +436,12 @@ class Engine:
             if self._remaining(s) == 0:
                 return [self._w_full(uid, u, s)]
             entry["code"] = self._code("W")
-            self._regs(s.id).append(entry)
             u["state"] = None
+            if self._needs_payment(s):
+                entry["status"], entry["expires"] = "pending", self.now + self._hold_seconds()
+                self._regs(s.id).append(entry)
+                return [self._hold_out(uid, s, entry, f"📝 اطلاعات شما برای کارگاه «{s.title}» ثبت شد.")]
+            self._regs(s.id).append(entry)
             return [self._menu(uid, f"✅ ثبت‌نام شما در کارگاه «{s.title}» انجام شد.\n🗓 {s.when}\n"
                                     f"🔖 کد پیگیری: {entry['code']}")]
         if not self._waitlist_has_room(s):
@@ -330,13 +459,18 @@ class Engine:
         if not regs and not waits:
             return self._menu(uid, "شما هنوز در هیچ کارگاهی ثبت‌نام نکرده‌اید.")
         lines = ["🎟 ثبت‌نام‌های شما:"]
+        pay_buttons = []
         for s in regs:
-            code = next(r["code"] for r in self._regs(s.id) if r["uid"] == uid)
-            lines.append(f"✅ {s.title} — {s.when} (کد: {code})")
+            r = next(r for r in self._regs(s.id) if r["uid"] == uid)
+            if r.get("status") == "pending":
+                lines.append(f"💳 {s.title} — در انتظار پرداخت (تا {self._left_minutes(r)} دقیقه)")
+                pay_buttons.append([L.W_PAY + s.title])
+            else:
+                lines.append(f"✅ {s.title} — {s.when} (کد: {r['code']})")
         for s in waits:
             pos = next(i + 1 for i, r in enumerate(self._wait(s.id)) if r["uid"] == uid)
             lines.append(f"⏳ {s.title} — نفر {pos} فهرست انتظار")
-        return self._menu(uid, "\n".join(lines))
+        return Out(uid, "\n".join(lines), pay_buttons + self.main_buttons())
 
     def _w_cancel_menu(self, uid) -> Out:
         items = self._user_regs(uid) + [s for s in self._user_waits(uid)]
@@ -352,16 +486,13 @@ class Engine:
             return [self._menu(uid, f"شما از فهرست انتظار «{s.title}» خارج شدید.")]
         if not any(r["uid"] == uid for r in regs):
             return [self._menu(uid, f"شما در کارگاه «{s.title}» ثبت‌نام نکرده‌اید.")]
+        was_paid = any(r["uid"] == uid and r.get("status") == "paid" for r in regs)
         regs[:] = [r for r in regs if r["uid"] != uid]
-        outs = [self._menu(uid, f"❌ ثبت‌نام شما در کارگاه «{s.title}» لغو شد.")]
-        # Promote from the waitlist while there is free capacity.
-        while self.spec.workshop.waitlist.enabled and wait and self._remaining(s) > 0:
-            nxt = wait.pop(0)
-            nxt["code"] = self._code("W")
-            regs.append(nxt)
-            outs.append(Out(nxt["uid"], f"🎉 خبر خوب! در کارگاه «{s.title}» جا باز شد و ثبت‌نام شما قطعی شد.\n"
-                                        f"🗓 {s.when}\n🔖 کد پیگیری: {nxt['code']}", self.main_buttons()))
-        return outs
+        msg = f"❌ ثبت‌نام شما در کارگاه «{s.title}» لغو شد."
+        if was_paid:
+            msg += "\nبرای بازگشت وجه با پشتیبانی تماس بگیرید." + (
+                f"\n☎️ {self.spec.support_contact}" if self.spec.support_contact else "")
+        return [self._menu(uid, msg)] + self._promote(s)
 
     # ==================== ORDER ====================
     def _item(self, iid):
@@ -552,7 +683,15 @@ class Engine:
             "subtotal": sub, "delivery_fee": fee, "total": total,
             "fields": u["state"]["values"], "status": "new",
         }
-        self.data["orders"].append(order)
         u["cart"], u["state"] = [], None
+        if self.spec.order.require_payment and total > 0:
+            order["status"], order["expires"] = "pending_payment", self.now + self._hold_seconds()
+            self.data["orders"].append(order)
+            return [Out(uid, f"📝 سفارش {order['code']} ثبت شد و تا {self._left_minutes(order)} دقیقه منتظر پرداخت است.\n"
+                             f"💳 مبلغ قابل پرداخت: {self.money(total)}\nبدون پرداخت، سفارش قطعی نمی‌شود.",
+                        self.main_buttons(),
+                        invoice={"payload": f"O:{order['code']}", "title": f"سفارش {order['code']}"[:32],
+                                 "description": f"سفارش از {self.spec.business_name}"[:255], "amount": total})]
+        self.data["orders"].append(order)
         return [self._menu(uid, f"✅ سفارش شما ثبت شد.\n🔖 شماره سفارش: {order['code']}\n"
                                 f"💳 مبلغ کل: {self.money(total)}\nاز خرید شما متشکریم 🙏")]

@@ -7,12 +7,22 @@ function People({ rows, emptyText }) {
   if (!rows.length) return <div className="py-2 text-sm text-slate-400">{emptyText}</div>
   return (
     <table className="w-full text-sm">
-      <thead><tr className="text-right text-slate-500"><th className="py-1.5 font-normal">#</th><th className="font-normal">کد</th><th className="font-normal">نام</th><th className="font-normal">موبایل</th></tr></thead>
+      <thead><tr className="text-right text-slate-500"><th className="py-1.5 font-normal">#</th><th className="font-normal">کد</th><th className="font-normal">نام</th><th className="font-normal">موبایل</th><th className="font-normal">وضعیت</th></tr></thead>
       <tbody>{rows.map((r, i) => (
-        <tr key={i} className="border-t border-slate-100"><td className="py-2">{i + 1}</td><td dir="ltr" className="text-right">{r.code}</td><td>{r.name || '—'}</td><td dir="ltr" className="text-right">{r.phone || '—'}</td></tr>
+        <tr key={i} className="border-t border-slate-100"><td className="py-2">{i + 1}</td><td dir="ltr" className="text-right">{r.code}</td><td>{r.name || '—'}</td><td dir="ltr" className="text-right">{r.phone || '—'}</td><td>{statusBadge(r.status)}</td></tr>
       ))}</tbody>
     </table>
   )
+}
+
+const STATUS = {
+  paid: ['green', 'پرداخت‌شده'], pending: ['amber', 'در انتظار پرداخت'], pending_payment: ['amber', 'در انتظار پرداخت'],
+  expired: ['red', 'منقضی'], new: ['blue', 'جدید'], confirmed: ['slate', 'ثبت‌شده'],
+}
+function statusBadge(st) {
+  if (!st) return null
+  const [tone, label] = STATUS[st] || ['slate', st]
+  return <Badge tone={tone}>{label}</Badge>
 }
 
 export default function DataView({ bot }) {
@@ -52,7 +62,7 @@ export default function DataView({ bot }) {
               {data.orders.map((o) => (
                 <div key={o.code} className="rounded-2xl border border-slate-200 p-4 text-sm">
                   <div className="flex items-center justify-between">
-                    <span className="font-bold" dir="ltr">{o.code}</span><span className="font-bold">{fmt(o.total)} تومان</span>
+                    <span className="flex items-center gap-2"><span className="font-bold" dir="ltr">{o.code}</span>{statusBadge(o.status)}{o.paid && <Badge tone="green">پرداخت‌شده</Badge>}</span><span className="font-bold">{fmt(o.total)} تومان</span>
                   </div>
                   <div className="mt-2 text-slate-600">{o.lines.map((l) => `${l.item} × ${l.qty}`).join('، ')}</div>
                   <div className="mt-2 flex flex-wrap gap-x-4 text-xs text-slate-500">

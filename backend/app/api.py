@@ -9,7 +9,7 @@ from . import agent, platforms
 from .auth import check_password, current_user, hash_password, make_token
 from .config import LLM_API_KEY, LLM_MODEL, PUBLIC_URL
 from .db import Bot, BotData, BotVersion, Message, SessionLocal, User
-from .engine import Engine
+from .engine import Engine, Out
 from .spec import BotSpec
 
 router = APIRouter()
@@ -65,6 +65,12 @@ def health():
             "mode": "webhook" if PUBLIC_URL else "polling"}
 
 
+@router.get("/api/health/platforms")
+def health_platforms():
+    """Whether this server can reach the Bale and Telegram APIs."""
+    return platforms.reachability()
+
+
 # ----------------------------- bots -----------------------------
 def _own(db, bot_id: int, user: User) -> Bot:
     bot = db.get(Bot, bot_id)
@@ -86,6 +92,9 @@ def _bot_out(db, bot: Bot, full=False):
         "id": bot.id, "name": bot.name, "template": bot.template, "platform": bot.platform,
         "bot_username": bot.bot_username, "has_token": bool(bot.token),
         "token_hint": (bot.token[:6] + "…" + bot.token[-4:]) if bot.token else "",
+        "has_payment_token": bool(bot.payment_token),
+        "payment_hint": (bot.payment_token[:8] + "…" + bot.payment_token[-4:]) if bot.payment_token else "",
+        "payment_test": bool(bot.payment_token) and ("TEST" in bot.payment_token.upper()),
         "agent_status": bot.agent_status, "created_at": bot.created_at.isoformat(),
         "live_version": live.number if live else None,
         "latest_version": versions[0].number if versions else None,
@@ -194,6 +203,33 @@ def simulate(bot_id: int, body: SimIn, user: User = Depends(current_user)):
     return {"replies": [o.as_dict() for o in outs]}
 
 
+class SimPayIn(BaseModel):
+    payload: str = Field(min_length=1, max_length=128)
+    user: str = Field(default="u1", max_length=20)
+    version_id: int
+
+
+@router.post("/api/bots/{bot_id}/sim/pay")
+def simulate_payment(bot_id: int, body: SimPayIn, user: User = Depends(current_user)):
+    """Sandbox payment: the same pre-checkout + success path a real Bale/Telegram payment takes."""
+    with platforms.lock_for(bot_id), SessionLocal() as db:
+        _own(db, bot_id, user)
+        v = db.get(BotVersion, body.version_id)
+        if not v or v.bot_id != bot_id:
+            raise HTTPException(404, "نسخه یافت نشد")
+        row = platforms.load_data(db, bot_id, "sandbox")
+        data = copy.deepcopy(row.data or {})
+        eng = Engine(BotSpec.model_validate(v.spec), data)
+        err, outs = eng.pre_checkout(body.user, body.payload)
+        if err:
+            outs.append(Out(body.user, "❌ پرداخت رد شد: " + err))
+        else:
+            outs += eng.payment_success(body.user, body.payload, f"SANDBOX-{secrets.token_hex(3).upper()}")
+        platforms.save_data(row, data)
+        db.commit()
+    return {"replies": [o.as_dict() for o in outs]}
+
+
 @router.post("/api/bots/{bot_id}/sim/reset")
 def sim_reset(bot_id: int, user: User = Depends(current_user)):
     with platforms.lock_for(bot_id), SessionLocal() as db:
@@ -225,7 +261,8 @@ def bot_data(bot_id: int, scope: str = "live", user: User = Depends(current_user
             regs = data.get("regs", {}).get(s.id, [])
             wait = data.get("wait", {}).get(s.id, [])
             sessions.append({"id": s.id, "title": s.title, "when": s.when, "capacity": s.capacity,
-                             "registrations": [{"code": r.get("code"), **r.get("fields", {})} for r in regs],
+                             "registrations": [{"code": r.get("code"), "status": r.get("status", "confirmed"),
+                                                **r.get("fields", {})} for r in regs],
                              "waitlist": [{"code": r.get("code"), **r.get("fields", {})} for r in wait]})
         return {"template": "workshop", "sessions": sessions}
     return {"template": "order", "orders": list(reversed(data.get("orders", [])))}
@@ -236,6 +273,7 @@ class PublishIn(BaseModel):
     version_id: int
     platform: str = "bale"
     token: str = ""
+    payment_token: str = ""  # empty = keep the saved one
 
 
 @router.post("/api/bots/{bot_id}/publish")
@@ -256,7 +294,11 @@ def publish(bot_id: int, body: PublishIn, user: User = Depends(current_user)):
             raise HTTPException(400, f"توکن تأیید نشد: {e}")
         if bot.token and (bot.token != token or bot.platform != body.platform):
             platforms.disconnect(bot)
+        if bot.platform != body.platform and not body.payment_token.strip():
+            bot.payment_token = ""  # a payment token belongs to one platform
         bot.platform, bot.token = body.platform, token
+        if body.payment_token.strip():
+            bot.payment_token = body.payment_token.strip()
         bot.bot_username = me.get("username", "")
         bot.live_version_id = v.id
         db.commit()
