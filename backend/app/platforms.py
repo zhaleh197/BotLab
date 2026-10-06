@@ -7,7 +7,7 @@ from typing import Optional
 import httpx
 from sqlalchemy.orm.attributes import flag_modified
 
-from .config import PUBLIC_URL
+from .config import PUBLIC_URL, TELEGRAM_PAYMENT_CURRENCY, TOMAN_PER_USD
 from .db import Bot, BotData, BotVersion, SessionLocal
 from .engine import Engine, Out
 from .spec import BotSpec
@@ -38,7 +38,21 @@ def call(platform: str, token: str, method: str, payload: Optional[dict] = None,
     return data.get("result")
 
 
-def send(platform: str, token: str, out: Out):
+def platform_amount(platform: str, amount: int, currency_label: str) -> tuple[str, int]:
+    """Convert a spec price into (currency, smallest-unit amount) for the platform's invoice.
+
+    Bale charges in rials. Telegram's payment providers have no rial, so for Telegram (demo/test) the toman
+    price is converted to TELEGRAM_PAYMENT_CURRENCY cents at TOMAN_PER_USD.
+    """
+    rial = amount * 10 if "تومان" in currency_label else amount
+    if platform == "bale":
+        return "IRR", rial
+    return TELEGRAM_PAYMENT_CURRENCY, max(100, round(rial / 10 / TOMAN_PER_USD * 100))
+
+
+def send(bot: dict, out: Out, currency_label: str = "تومان"):
+    """bot = {"platform", "token", "payment_token"}"""
+    platform, token = bot["platform"], bot["token"]
     payload = {"chat_id": out.to, "text": out.text}
     if out.buttons:
         payload["reply_markup"] = {"keyboard": [[{"text": b} for b in row] for row in out.buttons],
@@ -47,6 +61,28 @@ def send(platform: str, token: str, out: Out):
         call(platform, token, "sendMessage", payload)
     except PlatformError as e:
         print(f"[send] {platform} chat={out.to}: {e}")
+    if not out.invoice:
+        return
+    if not bot.get("payment_token"):
+        try:
+            call(platform, token, "sendMessage", {"chat_id": out.to, "text":
+                 "⚠️ پرداخت آنلاین هنوز توسط کسب‌وکار فعال نشده است. لطفاً با پشتیبانی تماس بگیرید."})
+        except PlatformError:
+            pass
+        return
+    inv = out.invoice
+    currency, amount = platform_amount(platform, inv["amount"], currency_label)
+    try:
+        call(platform, token, "sendInvoice", {
+            "chat_id": out.to, "title": inv["title"], "description": inv["description"],
+            "payload": inv["payload"], "provider_token": bot["payment_token"], "currency": currency,
+            "prices": [{"label": inv["title"], "amount": amount}]})
+    except PlatformError as e:
+        print(f"[invoice] {platform} chat={out.to}: {e}")
+        try:
+            call(platform, token, "sendMessage", {"chat_id": out.to, "text": f"⚠️ صدور صورت‌حساب ناموفق بود: {e}"})
+        except PlatformError:
+            pass
 
 
 def load_data(db, bot_id: int, scope: str) -> BotData:
@@ -63,27 +99,97 @@ def save_data(row: BotData, data: dict):
     flag_modified(row, "data")
 
 
+def _bot_info(bot: Bot) -> dict:
+    return {"platform": bot.platform, "token": bot.token, "payment_token": bot.payment_token or ""}
+
+
 def process_update(bot_id: int, update: dict) -> list[Out]:
-    """Run one incoming platform update through the live version and send the replies."""
+    """Run one incoming platform update (message, payment check or payment receipt) through the live version."""
+    pcq = update.get("pre_checkout_query")
     msg = update.get("message") or update.get("edited_message")
-    if not msg or "text" not in msg or msg.get("chat", {}).get("type", "private") != "private":
-        return []
-    chat_id = str(msg["chat"]["id"])
-    name = (msg.get("from") or {}).get("first_name", "")
+    if not pcq:
+        if not msg or msg.get("chat", {}).get("type", "private") != "private":
+            return []
+        if "text" not in msg and "successful_payment" not in msg:
+            return []
+    answer = None
     with lock_for(bot_id), SessionLocal() as db:
         bot = db.get(Bot, bot_id)
         if not bot or not bot.live_version_id:
             return []
-        v = db.get(BotVersion, bot.live_version_id)
+        spec = BotSpec.model_validate(db.get(BotVersion, bot.live_version_id).spec)
         row = load_data(db, bot_id, "live")
         data = copy.deepcopy(row.data or {})
-        outs = Engine(BotSpec.model_validate(v.spec), data).handle(chat_id, msg["text"], name=name)
+        eng = Engine(spec, data)
+        if pcq:
+            # The platform asks whether it may charge the user; must be answered within 10 seconds.
+            err, outs = eng.pre_checkout(str(pcq["from"]["id"]), pcq.get("invoice_payload", ""))
+            answer = {"pre_checkout_query_id": pcq["id"], "ok": err is None}
+            if err:
+                answer["error_message"] = err
+        elif "successful_payment" in msg:
+            sp = msg["successful_payment"]
+            charge = sp.get("provider_payment_charge_id") or sp.get("telegram_payment_charge_id") or ""
+            outs = eng.payment_success(str(msg["chat"]["id"]), sp.get("invoice_payload", ""), str(charge),
+                                       sp.get("total_amount", 0))
+        else:
+            name = (msg.get("from") or {}).get("first_name", "")
+            outs = eng.handle(str(msg["chat"]["id"]), msg["text"], name=name)
         save_data(row, data)
         db.commit()
-        platform, token = bot.platform, bot.token
+        info = _bot_info(bot)
+    if answer:
+        try:
+            call(info["platform"], info["token"], "answerPreCheckoutQuery", answer, timeout=8)
+        except PlatformError as e:
+            print(f"[pre_checkout] bot {bot_id}: {e}")
     for o in outs:
-        send(platform, token, o)
+        send(info, o, spec.currency)
     return outs
+
+
+def sweep_all():
+    """Release expired payment holds of live bots and notify the affected users."""
+    with SessionLocal() as db:
+        ids = [b.id for b in db.query(Bot).filter(Bot.live_version_id.isnot(None)).all()]
+    for bot_id in ids:
+        try:
+            with lock_for(bot_id), SessionLocal() as db:
+                bot = db.get(Bot, bot_id)
+                spec = BotSpec.model_validate(db.get(BotVersion, bot.live_version_id).spec)
+                cfg = spec.workshop or spec.order
+                if not cfg.require_payment:
+                    continue
+                row = load_data(db, bot_id, "live")
+                data = copy.deepcopy(row.data or {})
+                outs = Engine(spec, data).sweep()
+                if not outs:
+                    continue
+                save_data(row, data)
+                db.commit()
+                info = _bot_info(bot)
+            for o in outs:
+                send(info, o, spec.currency)
+        except Exception as e:
+            print(f"[sweep] bot {bot_id}: {e}")
+
+
+def _sweep_loop():
+    while True:
+        time.sleep(60)
+        sweep_all()
+
+
+def reachability() -> dict:
+    """Can this server reach the messenger APIs? (Bale may be unreachable from outside Iran.)"""
+    out = {}
+    for name, base in API_BASE.items():
+        try:
+            r = httpx.get(base.format(token="0:check") + "getMe", timeout=8)
+            out[name] = {"reachable": True, "status": r.status_code}
+        except Exception as e:
+            out[name] = {"reachable": False, "error": str(e)[:200]}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +202,8 @@ def connect(bot: Bot) -> str:
     """Point the platform at us. Returns the mode used ('webhook' or 'polling')."""
     if PUBLIC_URL:
         url = f"{PUBLIC_URL}/hook/{bot.id}/{bot.webhook_secret}"
-        call(bot.platform, bot.token, "setWebhook", {"url": url})
+        call(bot.platform, bot.token, "setWebhook",
+             {"url": url, "allowed_updates": ["message", "pre_checkout_query"]})
         return "webhook"
     try:
         call(bot.platform, bot.token, "deleteWebhook", {})
@@ -153,7 +260,8 @@ def _poll_loop(bot_id: int, stop: threading.Event):
 
 
 def resume_all():
-    """On startup: re-register live bots (needed for polling mode and after redeploys)."""
+    """On startup: re-register live bots (needed for polling mode and after redeploys) and start the sweeper."""
+    threading.Thread(target=_sweep_loop, daemon=True).start()
     with SessionLocal() as db:
         bots = db.query(Bot).filter(Bot.live_version_id.isnot(None)).all()
     for b in bots:

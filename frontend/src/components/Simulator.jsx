@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bot, RotateCcw, Send, Info } from 'lucide-react'
-import { api } from '../api'
+import { Bot, RotateCcw, Send, Info, CreditCard } from 'lucide-react'
+import { api, fmt } from '../api'
 import { Button } from './ui'
 
 const USERS = [
@@ -22,20 +22,37 @@ export default function Simulator({ botId, version }) {
 
   useEffect(() => { endRef.current?.scrollIntoView({ block: 'end' }) }, [msgs.length, user])
 
+  const deliver = (replies) => {
+    setChats((c) => {
+      const next = { ...c }
+      for (const rep of replies) {
+        next[rep.to] = [...(next[rep.to] || []), { from: 'bot', text: rep.text, buttons: rep.buttons }]
+        if (rep.invoice) next[rep.to] = [...next[rep.to], { from: 'invoice', invoice: rep.invoice }]
+      }
+      return next
+    })
+    const others = replies.filter((x) => x.to !== user)
+    if (others.length) setUnread((u) => { const n = { ...u }; others.forEach((o) => { n[o.to] = (n[o.to] || 0) + 1 }); return n })
+  }
+
   const send = async (t) => {
     const value = (t ?? text).trim()
     if (!value || busy) return
     setText(''); setBusy(true)
     setChats((c) => ({ ...c, [user]: [...c[user], { from: 'me', text: value }] }))
     try {
-      const r = await api(`/api/bots/${botId}/sim`, { method: 'POST', body: { text: value, user, version_id: version.id } })
-      setChats((c) => {
-        const next = { ...c }
-        for (const rep of r.replies) next[rep.to] = [...(next[rep.to] || []), { from: 'bot', text: rep.text, buttons: rep.buttons }]
-        return next
-      })
-      const others = r.replies.filter((x) => x.to !== user)
-      if (others.length) setUnread((u) => { const n = { ...u }; others.forEach((o) => { n[o.to] = (n[o.to] || 0) + 1 }); return n })
+      deliver((await api(`/api/bots/${botId}/sim`, { method: 'POST', body: { text: value, user, version_id: version.id } })).replies)
+    } catch (e) {
+      setChats((c) => ({ ...c, [user]: [...c[user], { from: 'bot', text: '⚠️ ' + e.message }] }))
+    } finally { setBusy(false) }
+  }
+
+  const pay = async (invoice) => {
+    if (busy) return
+    setBusy(true)
+    setChats((c) => ({ ...c, [user]: [...c[user], { from: 'me', text: `💳 پرداخت ${fmt(invoice.amount)} ${version.spec.currency}` }] }))
+    try {
+      deliver((await api(`/api/bots/${botId}/sim/pay`, { method: 'POST', body: { payload: invoice.payload, user, version_id: version.id } })).replies)
     } catch (e) {
       setChats((c) => ({ ...c, [user]: [...c[user], { from: 'bot', text: '⚠️ ' + e.message }] }))
     } finally { setBusy(false) }
@@ -65,7 +82,22 @@ export default function Simulator({ botId, version }) {
               <div className="mt-2 text-xs text-slate-600">به‌جای {USERS.find((u) => u.id === user).name} پیام می‌دهید</div>
             </div>
           )}
-          {msgs.map((m, i) => (
+          {msgs.map((m, i) => m.from === 'invoice' ? (
+            <div key={i} className="fade-up flex justify-end">
+              <div className="w-[85%] overflow-hidden rounded-2xl bg-white shadow-sm">
+                <div className="flex items-center gap-2 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-800"><CreditCard className="size-4" />صورت‌حساب</div>
+                <div className="px-3 py-2 text-[13px] leading-6">
+                  <div className="font-bold">{m.invoice.title}</div>
+                  <div className="text-xs text-slate-500">{m.invoice.description}</div>
+                  <div className="mt-1 font-bold">{fmt(m.invoice.amount)} {version.spec.currency}</div>
+                </div>
+                <button onClick={() => pay(m.invoice)} disabled={busy}
+                  className="w-full border-t border-slate-100 py-2 text-sm font-medium text-[#2b5278] hover:bg-slate-50 disabled:opacity-50 cursor-pointer">
+                  پرداخت آزمایشی
+                </button>
+              </div>
+            </div>
+          ) : (
             <div key={i} className={`fade-up flex ${m.from === 'me' ? 'justify-start' : 'justify-end'}`}>
               <div className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-[13px] leading-6 shadow-sm ${m.from === 'me' ? 'rounded-tr-sm bg-[#effdde]' : 'rounded-tl-sm bg-white'}`}>
                 {m.text}
@@ -112,7 +144,7 @@ export default function Simulator({ botId, version }) {
         <Button variant="secondary" onClick={reset} className="w-full"><RotateCcw className="size-4" />پاک کردن داده‌های آزمایشی</Button>
         <div className="flex gap-2 rounded-xl bg-slate-50 p-3 text-xs leading-6 text-slate-600">
           <Info className="size-4 shrink-0 text-slate-400" />
-          <span>این شبیه‌ساز دقیقاً همان موتوری را اجرا می‌کند که بات واقعی روی بله و تلگرام اجرا می‌کند. با چند کاربر می‌توانید پر شدن ظرفیت و فهرست انتظار را امتحان کنید. داده‌های این بخش از داده‌های واقعی جداست.</span>
+          <span>این شبیه‌ساز دقیقاً همان موتوری را اجرا می‌کند که بات واقعی روی بله و تلگرام اجرا می‌کند. با چند کاربر می‌توانید پر شدن ظرفیت و فهرست انتظار را امتحان کنید. «پرداخت آزمایشی» همان مسیر تأیید پرداخت واقعی را طی می‌کند، بدون جابه‌جایی پول. داده‌های این بخش از داده‌های واقعی جداست.</span>
         </div>
       </div>
     </div>

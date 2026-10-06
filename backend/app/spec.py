@@ -31,6 +31,9 @@ class WorkshopConfig(BaseModel):
     max_per_user: int = Field(default=1, ge=1, description="Max number of sessions one user may register for")
     waitlist: Waitlist = Waitlist()
     collect_fields: list[FieldName] = ["name", "phone"]
+    require_payment: bool = Field(default=False, description="Online payment (Bale/Telegram invoice) is required before a "
+                                  "registration for a paid session is confirmed; the seat is held meanwhile")
+    payment_hold_minutes: int = Field(default=15, ge=5, le=120, description="How long a seat is held awaiting payment")
 
 
 class MenuItem(BaseModel):
@@ -58,6 +61,8 @@ class OrderConfig(BaseModel):
     items: list[MenuItem] = Field(min_length=1)
     rules: OrderRules = OrderRules()
     collect_fields: list[FieldName] = ["name", "phone"]
+    require_payment: bool = Field(default=False, description="Orders must be paid online (invoice) before they are accepted")
+    payment_hold_minutes: int = Field(default=15, ge=5, le=120, description="How long an unpaid order stays valid")
 
 
 class BotSpec(BaseModel):

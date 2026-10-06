@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, Text, DateTime, create_engine
+from sqlalchemy import JSON, ForeignKey, Integer, String, Text, DateTime, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import DATABASE_URL
@@ -36,6 +36,8 @@ class Bot(Base):
     template: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     platform: Mapped[str] = mapped_column(String(20), default="bale")  # bale | telegram
     token: Mapped[str] = mapped_column(String(200), default="")
+    # Payment provider token from the platform's BotFather (Bale wallet / Telegram payments).
+    payment_token: Mapped[str] = mapped_column(String(300), default="")
     bot_username: Mapped[str] = mapped_column(String(120), default="")
     webhook_secret: Mapped[str] = mapped_column(String(64), default="")
     live_version_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -77,5 +79,16 @@ class BotData(Base):
     data: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+# Columns added after the first deploy: create_all() does not alter existing tables.
+_ADDED_COLUMNS = {"bots": {"payment_token": "VARCHAR(300) DEFAULT ''"}}
+
+
 def init_db():
     Base.metadata.create_all(engine)
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table, cols in _ADDED_COLUMNS.items():
+            have = {c["name"] for c in insp.get_columns(table)}
+            for name, ddl in cols.items():
+                if name not in have:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))

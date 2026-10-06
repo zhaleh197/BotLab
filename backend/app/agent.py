@@ -35,14 +35,19 @@ Supported bot templates (the ONLY things you can build):
    - max sessions per user (max_per_user)
    - optional waitlist (enabled, max_size): when full, users can join; on cancellation the first in line is
      auto-registered and notified
+   - optional online payment (require_payment, payment_hold_minutes): for paid sessions the seat is held for N
+     minutes and the registration is confirmed ONLY after the platform confirms payment; unpaid holds expire and
+     the seat goes back (or to the waitlist)
 2) order — ordering bot for a limited menu (cafe, restaurant, bakery, shop):
    - menu items (name, price, category, available flag, options like size that customer must choose)
    - cart (add/remove), checkout collecting fields from: name, phone, address, note
    - rules: min_order_total, max_qty_per_item, max_items_per_order, delivery with delivery_fee and
      free_delivery_over threshold, ordering hours (open_hour, close_hour)
+   - optional online payment (require_payment): the order is accepted only after payment
 Common: business_name, welcome_message, currency (default تومان), support_contact.
-NOT supported: online payment, scheduled reminders, AI chat inside the bot, images, group chats, discount codes,
-multi-language. Received data (registrations/orders) is visible to the owner in the web dashboard.
+Payments run inside Bale (rial, Bale wallet) or Telegram via the platform's invoice system.
+NOT supported: refunds (handled by the business manually), discount codes, scheduled reminders, AI chat inside the bot, images, group chats, discount codes,
+multi-language, other payment gateways. Received data (registrations/orders) is visible to the owner in the web dashboard.
 """
 
 
@@ -68,8 +73,9 @@ def engine_contract(template: str) -> str:
   "شما نفر K فهرست انتظار". The session list itself never shows a join button.
 - "{L.W_MY}" lists registrations ("✅ <title>") and waitlist positions.
 - "{L.W_CANCEL}" shows buttons "{L.W_CANCEL_ITEM}<title>"; pressing one -> "لغو شد"; if waitlist enabled the first
-  waiting user receives "ثبت‌نام شما قطعی شد" (use step.notify to check another user got it).
-"""
+  waiting user receives "جا باز شد" (use step.notify to check another user got it).
+- "{L.W_MY}" shows a pending (unpaid) seat as "در انتظار پرداخت" with a button "{L.W_PAY}<title>".
+""" + PAYMENT_CONTRACT
     return common + f"""Order runtime:
 - Main menu buttons: "{L.O_MENU}", "{L.O_CART}", "{L.O_CHECKOUT}", "{L.O_CLEAR}".
 - "{L.O_MENU}" lists items with prices ("(ناموجود)" for unavailable) and buttons "{L.O_ADD}<name>" only for
@@ -83,8 +89,17 @@ def engine_contract(template: str) -> str:
   below minimum -> "حداقل مبلغ سفارش"; else asks fields (address is added automatically if delivery is on).
 - Confirm -> "سفارش شما ثبت شد" + "شماره سفارش" + "مبلغ کل: X".
 - Test cases may set "now_hour" (0-23) to simulate the local time; default is 12.
-"""
+""" + PAYMENT_CONTRACT
 
+
+PAYMENT_CONTRACT = """Online payment (only when require_payment is true and the price/total is > 0):
+- Confirming a paid registration/order does NOT confirm it: the reply says it is held and contains "پرداخت"
+  plus an invoice, which tests see as "💳 صورت‌حساب". It must NOT contain "کد پیگیری" yet.
+- A step {"user": "u1", "pay": true} pays the latest invoice of that user -> "پرداخت انجام شد" and "قطعی شد".
+- A step {"wait_minutes": N} (optionally with "send") moves the clock forward first; after payment_hold_minutes
+  an unpaid hold expires -> that user gets "مهلت پرداخت" and the seat is freed; paying later -> "پرداخت رد شد".
+- A step must have at least one of: send, pay, wait_minutes.
+"""
 
 SPEC_SCHEMA = json.dumps(BotSpec.model_json_schema(), ensure_ascii=False)
 
@@ -140,6 +155,8 @@ Rules:
   workshop bot the essentials are: the sessions (title, time, capacity) and price; for an order bot: the menu
   items with prices. Everything else (cancel policy, fields, delivery, limits) can be defaulted.
   Max 4 short questions; each must propose the default you'll use, e.g. "... (اگر نگویید: X)".
+- If something costs money (a paid session or an order) and the owner has not said whether customers must
+  pay online before confirmation, include that question (default: پرداخت آنلاین لازم نیست).
 - If the owner already gave the essentials, set ready=true with no questions. Prefer fewer questions.
 - must_proceed={str(must_proceed).lower()}: if true you MUST set ready=true and use reasonable defaults.
 - For "change", ready=true unless the change is truly ambiguous.
