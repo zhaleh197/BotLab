@@ -5,3 +5,6 @@ __pycache__/
 .env
 frontend/dist/
 .claude/
+submission/*.pdf
+submission/BotLab_submission/
+submission/BotLab_submission.zip
