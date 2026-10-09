@@ -255,17 +255,32 @@ def bot_data(bot_id: int, scope: str = "live", user: User = Depends(current_user
         spec = BotSpec.model_validate(db.get(BotVersion, vid).spec)
         data = platforms.load_data(db, bot_id, scope).data or {}
         db.commit()
+    def payment(entry, title, amount):
+        f = entry.get("fields", {})
+        return {"code": entry.get("code"), "title": title, "name": f.get("name", ""), "phone": f.get("phone", ""),
+                "amount": amount, "charge_id": entry.get("charge_id", ""), "paid_at": entry.get("paid_at")}
+
+    payments = []
+    extra = {"currency": spec.currency, "unmatched_payments": data.get("unmatched_payments", [])}
     if spec.template == "workshop":
         sessions = []
         for s in spec.workshop.sessions:
             regs = data.get("regs", {}).get(s.id, [])
             wait = data.get("wait", {}).get(s.id, [])
+            payments += [payment(r, s.title, r.get("amount", s.price)) for r in regs if r.get("status") == "paid"]
             sessions.append({"id": s.id, "title": s.title, "when": s.when, "capacity": s.capacity,
                              "registrations": [{"code": r.get("code"), "status": r.get("status", "confirmed"),
-                                                **r.get("fields", {})} for r in regs],
+                                                "charge_id": r.get("charge_id", ""), **r.get("fields", {})}
+                                               for r in regs],
                              "waitlist": [{"code": r.get("code"), **r.get("fields", {})} for r in wait]})
-        return {"template": "workshop", "sessions": sessions}
-    return {"template": "order", "orders": list(reversed(data.get("orders", [])))}
+        payments.sort(key=lambda p: p["paid_at"] or 0, reverse=True)
+        return {"template": "workshop", "sessions": sessions, "payments": payments,
+                "payments_total": sum(p["amount"] for p in payments), **extra}
+    orders = data.get("orders", [])
+    payments = [payment(o, "سفارش", o.get("total", 0)) for o in orders if o.get("paid")]
+    payments.sort(key=lambda p: p["paid_at"] or 0, reverse=True)
+    return {"template": "order", "orders": list(reversed(orders)), "payments": payments,
+            "payments_total": sum(p["amount"] for p in payments), **extra}
 
 
 # ----------------------------- publish -----------------------------

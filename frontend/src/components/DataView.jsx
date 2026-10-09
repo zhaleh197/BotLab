@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Database, RefreshCw } from 'lucide-react'
+import { CreditCard, Database, RefreshCw } from 'lucide-react'
 import { api, fmt } from '../api'
 import { Badge, Empty, Spinner } from './ui'
 
@@ -25,6 +25,44 @@ function statusBadge(st) {
   return <Badge tone={tone}>{label}</Badge>
 }
 
+function Payments({ data }) {
+  const list = data.payments || []
+  const unmatched = data.unmatched_payments || []
+  return (
+    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/30 p-4">
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <CreditCard className="size-5 text-emerald-600" />
+        <div className="font-bold">پرداخت‌ها</div>
+        <Badge tone="green">{list.length} پرداخت موفق</Badge>
+        <div className="ms-auto text-sm">جمع دریافتی: <b>{fmt(data.payments_total)} {data.currency}</b></div>
+      </div>
+      {list.length === 0 ? <div className="text-sm text-slate-500">هنوز پرداختی انجام نشده است.</div> : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="text-right text-slate-500"><th className="py-1.5 font-normal">زمان</th><th className="font-normal">کد</th><th className="font-normal">بابت</th><th className="font-normal">پرداخت‌کننده</th><th className="font-normal">مبلغ</th><th className="font-normal">شمارهٔ تراکنش</th></tr></thead>
+            <tbody>{list.map((p, i) => (
+              <tr key={i} className="border-t border-emerald-100">
+                <td className="py-2 text-slate-500">{p.paid_at ? new Date(p.paid_at * 1000).toLocaleString('fa-IR') : '—'}</td>
+                <td dir="ltr" className="text-right">{p.code}</td>
+                <td>{p.title}</td>
+                <td>{p.name || '—'} <span dir="ltr" className="text-xs text-slate-500">{p.phone}</span></td>
+                <td className="font-medium">{fmt(p.amount)} {data.currency}</td>
+                <td dir="ltr" className="text-right font-mono text-xs">{p.charge_id || '—'}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+      {unmatched.length > 0 && (
+        <div className="mt-3 rounded-xl bg-amber-50 p-3 text-xs leading-6 text-amber-800">
+          {unmatched.length} پرداخت بعد از پایان مهلت رزرو رسیده و باید بازگردانده شود:{' '}
+          {unmatched.map((u) => u.charge_id || u.payload).join('، ')}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function DataView({ bot }) {
   const [scope, setScope] = useState(bot.live_version ? 'live' : 'sandbox')
   const [data, setData] = useState(null)
@@ -41,8 +79,9 @@ export default function DataView({ bot }) {
         <button onClick={load} className="ms-auto rounded-lg p-2 text-slate-500 hover:bg-slate-100 cursor-pointer" title="به‌روزرسانی"><RefreshCw className="size-4" /></button>
       </div>
       {!data ? <div className="grid place-items-center py-10"><Spinner className="size-6 text-brand-500" /></div> :
-        !data.template ? <Empty icon={Database} title="داده‌ای نیست" /> :
-          data.template === 'workshop' ? (
+        !data.template ? <Empty icon={Database} title="داده‌ای نیست" /> : <>
+          <Payments data={data} />
+          {data.template === 'workshop' ? (
             <div className="grid gap-4 md:grid-cols-2">
               {data.sessions.map((s) => (
                 <div key={s.id} className="rounded-2xl border border-slate-200 p-4">
@@ -72,6 +111,7 @@ export default function DataView({ bot }) {
               ))}
             </div>
           )}
+        </>}
     </div>
   )
 }

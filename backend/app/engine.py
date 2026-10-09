@@ -238,7 +238,9 @@ class Engine:
             return [self._menu(uid, "پرداخت شما دریافت شد اما مهلت رزرو تمام شده بود. "
                                     "برای پیگیری و بازگشت وجه با پشتیبانی تماس بگیرید." + support)]
         entry.pop("expires", None)
-        entry["charge_id"] = charge_id
+        entry["charge_id"], entry["paid_at"] = charge_id, self.now
+        if s:
+            entry["amount"] = s.price
         receipt = f"\n🧾 شمارهٔ تراکنش: {charge_id}" if charge_id else ""
         if s:  # workshop seat
             entry["status"] = "paid"
